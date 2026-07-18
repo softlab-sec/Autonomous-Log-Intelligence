@@ -1,0 +1,93 @@
+services:
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_NUM_PARALLEL=1
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    depends_on:
+      - ollama
+    ports:
+      - "3000:8080"
+    volumes:
+      - openwebui_data:/app/backend/data
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_AUTH=true
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    extra_hosts:
+      - "smtp-relay.brevo.com:1.179.115.1" #Replace this with your smtp server
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./incidents:/home/node/.n8n-files/incidents
+      - ./logstash/events:/home/node/.n8n-files/logstash-events:ro
+    environment:
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=${N8N_WEBHOOK_URL}
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_SECURE_COOKIE=false
+      - NODE_FUNCTION_ALLOW_BUILTIN=fs
+      - N8N_RUNNERS_ENABLED=false
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.12.0
+    container_name: logstash
+    restart: unless-stopped
+    ports:
+      - "5044:5044"
+      - "9600:9600"
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline
+      - ./logstash/events:/usr/share/logstash/data/events
+    environment:
+      - LS_JAVA_OPTS=-Xms512m -Xmx512m
+      - XPACK_MONITORING_ENABLED=false
+
+  fileserver:
+    image: python:3.11-slim
+    container_name: fileserver
+    restart: unless-stopped
+    volumes:
+      - ./logstash/events:/logs:ro
+    working_dir: /logs
+    command: ["python3", "-c", "import http.server,socketserver,mimetypes;mimetypes.add_type('text/plain','.log');socketserver.ThreadingTCPServer(('',8888),http.server.SimpleHTTPRequestHandler).serve_forever()"]
+    ports:
+      - "8888:8888"
+
+volumes:
+  ollama_data:
+  openwebui_data:
+  n8n_data:

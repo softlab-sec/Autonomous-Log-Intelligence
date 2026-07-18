@@ -1,0 +1,13 @@
+# secrets - never push the real env file
+.env
+*.key
+*.pem
+
+# private data / heavy files
+incidents/
+logstash/events/
+n8n_backup.tar.gz
+
+# local junk
+.DS_Store
+*.log
