@@ -1,0 +1,423 @@
+{
+  "name": "ALI Workflow V1",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 2
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -1824,
+        208
+      ],
+      "id": "042868c9-a40e-45e2-b224-896dc7643a5d",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "const today = new Date();\nconst yyyy = today.getFullYear();\nconst mm = String(today.getMonth() + 1).padStart(2, '0');\nconst dd = String(today.getDate()).padStart(2, '0');\nconst date = `${yyyy}-${mm}-${dd}`;\n\nreturn [\n  { json: { logtype: 'auth',   url: `http://fileserver:8888/auth-${date}.log` } },\n  { json: { logtype: 'nginx',  url: `http://fileserver:8888/nginx_access-${date}.log` } },\n  { json: { logtype: 'syslog', url: `http://fileserver:8888/syslog-${date}.log` } }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1616,
+        208
+      ],
+      "id": "7bf4022c-a21d-4ae5-9b82-0fba90c5b52b",
+      "name": "Build Filename"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -1440,
+        208
+      ],
+      "id": "0a33b8be-0848-462c-ba06-ec4e6e0508d3",
+      "name": "Fetch Log",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// FIFO queue with a per-run drain cap (prevents runaway / overlap)\nconst MAX_PER_RUN = 120;   // how many logs to process each trigger\n\nconst staticData = $getWorkflowStaticData('global');\nif (!Array.isArray(staticData.queue)) staticData.queue = [];\nif (!staticData.pos) staticData.pos = {};\n\nconst allItems = $input.all();\n\n// 1) ENQUEUE any new lines to the back of the queue\nfor (const item of allItems) {\n  const raw = item.json.data || item.json.body || item.json.response || '';\n  if (!raw || !raw.trim()) continue;\n\n  const url = (item.json.url || '') + '';\n  let source = item.json.logtype || 'log';\n  if (url.includes('nginx')) source = 'nginx';\n  else if (url.includes('syslog')) source = 'syslog';\n  else if (url.includes('auth')) source = 'auth';\n\n  const allLines = raw.trim().split('\\n').filter(l => l.trim());\n  const seen = staticData.pos[source] || 0;\n  const startFrom = (seen > allLines.length) ? 0 : seen;   // reset if file rotated\n  const newLines = allLines.slice(startFrom);\n\n  for (const line of newLines) {\n    let msg = line.trim();\n    let tags = [];\n    try {\n      const obj = JSON.parse(line);\n      msg = obj.message || obj.log_message || obj.event?.original || msg;\n      if (Array.isArray(obj.tags)) tags = obj.tags.filter(t => t && t !== 'beats_input_codec_plain_applied');\n    } catch (e) {}\n    staticData.queue.push({ source, event_line: msg, detected_tags: tags });\n  }\n  staticData.pos[source] = allLines.length;\n}\n\n// 2) DRAIN up to MAX_PER_RUN from the FRONT (oldest first)\nif (staticData.queue.length === 0) {\n  return [{ json: { skip: true, reason: 'Queue empty' } }];\n}\n\nconst batch = staticData.queue.splice(0, MAX_PER_RUN);   // takes oldest, leaves the rest\nconst remaining = staticData.queue.length;\n\nreturn batch.map((e, i) => ({\n  json: { ...e, queue_position: i + 1, queue_remaining: remaining }\n}));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1216,
+        192
+      ],
+      "id": "ccf4fc4d-b965-479f-9ac9-3e2c40be2e68",
+      "name": "Parse Log (FIFO)"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -976,
+        192
+      ],
+      "id": "72df42f3-00b4-4232-a083-7256d6626cbc",
+      "name": "Loop Over Logs"
+    },
+    {
+      "parameters": {
+        "model": "llama3.2:latest",
+        "options": {
+          "temperature": 0.3,
+          "numPredict": 300
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        -736,
+        480
+      ],
+      "id": "40b8a51e-d8e8-4f27-8613-a5437b88e78f",
+      "name": "Ollama Model",
+      "credentials": {
+        "ollamaApi": {
+          "id": "FOfmHEwYzywe8rSD",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst fullText = (input.output || input.response || input.text || '').trim();\n\nconst grab = (l) => { const m = fullText.match(new RegExp(l + ':\\\\s*([^\\\\n]+)', 'i')); return m ? m[1].trim() : ''; };\n\nconst timestamp = new Date().toISOString();\nconst filename = `incident-testsys-${timestamp.replace(/[:.]/g,'-')}.txt`;\nconst model = 'llama3.2:latest';\n\nlet type = grab('TYPE') || 'Log Event';\nlet source = grab('SOURCE') || 'testsys (192.168.253.151) - local system event';\nlet severity = grab('SEVERITY') || 'Informational';\nconst summary = grab('SUMMARY') || fullText || 'No analysis returned.';\nconst actions = [];\nfor (let n=1;n<=4;n++){ const a=grab('ACTION'+n); if(a) actions.push(a); }\n\nconst sevMap = { informational:'Informational', info:'Informational', low:'Low', medium:'Medium', high:'High', critical:'Critical' };\nseverity = sevMap[(severity||'').toLowerCase()] || 'Informational';\n\nconst rank = { Informational:0, Low:1, Medium:2, High:3, Critical:4 };\nconst shouldAlert = rank[severity] >= 1;\n\nconst cp = String.fromCodePoint;\nconst sevEmoji = { Informational: cp(0x2139), Low: cp(0x1F7E2), Medium: cp(0x1F7E1), High: cp(0x1F7E0), Critical: cp(0x1F534) };\nconst alarm = cp(0x1F6A8);\nconst sevColor = { Informational:'#6B7280', Low:'#1E8E3E', Medium:'#C87A00', High:'#E24A3B', Critical:'#7A0010' };\nconst color = sevColor[severity] || '#6B7280';\n\nfunction typeEmoji(t){ const s=(t||'').toLowerCase();\n  if(s.includes('ssh')||s.includes('brute')||s.includes('auth')||s.includes('login')) return cp(0x1F511);\n  if(s.includes('web')||s.includes('sql')||s.includes('xss')) return cp(0x1F489);\n  if(s.includes('scan')||s.includes('recon')) return cp(0x1F4E1);\n  if(s.includes('priv')||s.includes('sudo')||s.includes('escal')) return cp(0x2B06);\n  if(s.includes('malware')||s.includes('ransom')) return cp(0x1F9A0);\n  if(s.includes('cron')||s.includes('session')||s.includes('normal')) return cp(0x2705);\n  return cp(0x26A0); }\n\nconst te = typeEmoji(type);\nconst se = sevEmoji[severity] || alarm;\n\nconst recHtml = actions.map(a=>`<li style=\"margin:6px 0;color:#2C3E50;line-height:1.5;\">${a}</li>`).join('');\nconst emailHtml = `\n<div style=\"font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#F0F4F8;\">\n  <div style=\"background:#0D1B2A;padding:22px;border-bottom:4px solid ${color};\">\n    <h1 style=\"color:#fff;margin:0;font-size:21px;\">${se} ALI ALERT &mdash; <span style=\"color:${color};\">${severity}</span></h1>\n    <p style=\"color:#95A5A6;margin:6px 0 0;font-size:13px;\">AI-Powered Autonomous Log Intelligence</p>\n  </div>\n  <div style=\"padding:16px 22px;background:#fff;border-bottom:1px solid #e5e7eb;font-size:13px;color:#1A3A5C;\">\n    <div style=\"padding:4px 0;\"><b>Source Host:</b> testsys (192.168.253.151)</div>\n    <div style=\"padding:4px 0;\"><b>Timestamp:</b> ${timestamp}</div>\n    <div style=\"padding:4px 0;\"><b>Report File:</b> <span style=\"font-family:monospace;\">${filename}</span></div>\n  </div>\n  <div style=\"padding:20px 22px;\">\n    <div style=\"background:#fff;border-left:5px solid ${color};border-radius:6px;padding:18px 20px;box-shadow:0 1px 4px rgba(0,0,0,0.08);\">\n      <div style=\"font-size:17px;font-weight:bold;color:#1A3A5C;margin-bottom:8px;\">${te} ${type}</div>\n      <div style=\"display:inline-block;background:${color};color:#fff;font-size:11px;font-weight:bold;padding:4px 12px;border-radius:12px;margin-bottom:14px;\">${severity.toUpperCase()}</div>\n      <div style=\"margin:10px 0;color:#606060;font-size:13px;\"><b>Source:</b> ${source}</div>\n      <div style=\"margin:0 0 16px;color:#2C3E50;font-size:14px;line-height:1.6;\">${summary}</div>\n      <div style=\"font-size:12px;font-weight:bold;color:${color};margin-bottom:6px;\">RECOMMENDED ACTIONS</div>\n      <ul style=\"margin:0;padding-left:22px;\">${recHtml}</ul>\n    </div>\n  </div>\n  <div style=\"background:#0D1B2A;padding:14px;text-align:center;\">\n    <p style=\"color:#7F8C8D;font-size:11px;margin:0;\">ALI &middot; Autonomous Log Intelligence &middot; aisoc (192.168.253.149) &middot; Ollama ${model}</p>\n  </div>\n</div>`;\n\nconst recText = actions.map((a,i)=>`${i+1}. ${a}`).join('\\n');\nconst slackPayload = {\n  text: `${se} ALI ALERT - ${type} (${severity})`,\n  blocks: [\n    { type:'header', text:{ type:'plain_text', text:`${se} ALI ALERT - ${severity}`, emoji:true } },\n    { type:'section', text:{ type:'mrkdwn', text:`${te} *${type}*  \\`${severity.toUpperCase()}\\`\\n*Source:* ${source}\\n*Time:* ${timestamp}\\n*Report File:* \\`${filename}\\`` } },\n    { type:'section', text:{ type:'mrkdwn', text:`${summary}` } },\n    { type:'section', text:{ type:'mrkdwn', text:`*RECOMMENDED ACTIONS*\\n${recText}` } },\n    { type:'context', elements:[{ type:'mrkdwn', text:`ALI - Autonomous Log Intelligence - Ollama ${model}` }] }\n  ]\n};\n\nconst fileText = `ALI ALERT - ${severity}\\nType: ${type}\\nSource: ${source}\\nTime: ${timestamp}\\nReport File: ${filename}\\n\\nSUMMARY:\\n${summary}\\n\\nRECOMMENDED ACTIONS:\\n${recText}\\n`;\n\nreturn [{ json: { analysis: fileText, type, severity, source, summary, timestamp, filename, model, emailHtml, slackPayload, shouldAlert } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -368,
+        64
+      ],
+      "id": "0204507a-5baf-45b3-978b-ae376dfeb9ee",
+      "name": "Parse AI Response"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=Redacted",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackPayload) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        16,
+        -112
+      ],
+      "id": "31d21eaf-2991-4f06-820e-c2a9fe00e895",
+      "name": "Slack",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "subject": "=ALI Alert - {{ $json.severity }}",
+        "html": "={{ $json.emailHtml }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        32,
+        80
+      ],
+      "id": "d439cc13-b1de-465a-97cc-5186c1f3feb5",
+      "name": "Send an Email",
+      "webhookId": "Redacted",
+      "credentials": {
+        "smtp": {
+          "id": "Redacted",
+          "name": "SMTP account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "toText",
+        "sourceProperty": "analysis",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        32,
+        272
+      ],
+      "id": "e65c7e28-b6a0-4dd1-a9fc-57a6d6610488",
+      "name": "Convert to File",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/home/node/.n8n-files/incidents/{{ $('Parse AI Response').item.json.filename }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        176,
+        464
+      ],
+      "id": "4bed730c-53dd-42c5-8f0b-1c95f8b39d10",
+      "name": "Save Report",
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        176,
+        704
+      ],
+      "id": "463f7b28-6c51-40ea-bddc-fdbb2a8a8cac",
+      "name": "Done - Next Log"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.shouldAlert }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -256,
+        288
+      ],
+      "id": "f2562a5f-9c3e-4d6c-a6d5-f35934833784",
+      "name": "Is Threat?"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Analyze this single security log event.\n\nSource hint: {{ $json.source }}\nTags: {{ JSON.stringify($json.detected_tags) }}\n\nLOG ENTRY:\n{{ $json.event_line }}",
+        "options": {
+          "systemMessage": "You are a SOC analyst monitoring host testsys (192.168.253.151). You are given ONE log event at a time. Analyze it and assign an accurate severity. Do NOT default to Low. Judge each event on its real risk.\n\nReport ONLY what is in this log event. Never invent IPs, usernames, or events. For the Source: use the remote IP if present; otherwise \"testsys (192.168.253.151) - local system event\".\n\nSEVERITY RULES — follow these exactly:\n\n- Informational: routine, expected activity. Examples: \"session opened for user root by cron\", \"systemd started a service\", \"session closed\", normal CRON command runs.\n\n- Low: a single minor suspicious event. Examples: one \"Failed password\", one 404 response, a single invalid request.\n\n- Medium: repeated or clearly malicious activity. Examples: \"Invalid user admin\", multiple failed passwords, a scanner user-agent (sqlmap, Nikto, masscan, nmap), a suspicious URL probe (/etc/passwd, /.env, /admin).\n\n- High: an active attack. Examples: SQL injection (UNION SELECT, OR 1=1, DROP TABLE), XSS (<script>), path traversal (../), command injection, many failed logins forming a brute-force pattern, \"maximum authentication attempts exceeded\".\n\n- Critical: signs of actual compromise. Examples: \"Accepted password\" or \"Accepted publickey\" right after failed attempts (successful breach), privilege escalation, sudoers modification, new SSH key added, data exfiltration.\n\nMap the event to the HIGHEST rule it matches. A scanner tool is at least Medium. An injection or brute-force is at least High. Never rate an attack as Low.\n\nGive EXACTLY 4 recommended actions.\n\nRespond in EXACTLY this format and nothing else:\n\nTYPE: [what kind of event this is]\nSOURCE: [IP or local host]\nSEVERITY: [Informational or Low or Medium or High or Critical]\nSUMMARY: [1 to 2 sentences describing this event]\nACTION1: [step]\nACTION2: [step]\nACTION3: [step]\nACTION4: [step]"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        -752,
+        208
+      ],
+      "id": "e46a4beb-3df1-41d8-949a-daa284d466d2",
+      "name": "ALI Agent",
+      "onError": "continueErrorOutput"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Filename",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Filename": {
+      "main": [
+        [
+          {
+            "node": "Fetch Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Log": {
+      "main": [
+        [
+          {
+            "node": "Parse Log (FIFO)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Log (FIFO)": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Logs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Logs": {
+      "main": [
+        [],
+        [
+          {
+            "node": "ALI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "ALI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Response": {
+      "main": [
+        [
+          {
+            "node": "Is Threat?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert to File": {
+      "main": [
+        [
+          {
+            "node": "Save Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Report": {
+      "main": [
+        [
+          {
+            "node": "Done - Next Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Done - Next Log": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Logs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Threat?": {
+      "main": [
+        [
+          {
+            "node": "Slack",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send an Email",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Convert to File",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Done - Next Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ALI Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "09daee70-b459-4d10-bf8c-baab01611fe3",
+  "meta": {
+    "instanceId": "da0b1d652a63beb3df82a1075eac7abf7ebd46d7409593dbd947bf4b5caad035"
+  },
+  "id": "nRq2p0D5wL7WnQXh",
+  "tags": []
+}
